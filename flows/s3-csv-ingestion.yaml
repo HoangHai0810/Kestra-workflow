@@ -1,0 +1,398 @@
+id: s3-csv-ingestion
+namespace: com.flowio
+description: "Get CSV from S3 and insert into TimescaleDB, ClickHouse, and Elasticsearch"
+
+inputs:
+  - id: s3_bucket
+    type: STRING
+    defaults: "static-staging.flowio.app"
+  - id: s3_key
+    type: STRING
+    defaults: "resources/kestra-test/sample-metrics.csv"
+  - id: table_name
+    type: STRING
+    defaults: "test_metrics_data"
+  - id: delimiter
+    type: STRING
+    defaults: ","
+
+tasks:
+  - id: download_file
+    type: io.kestra.plugin.aws.s3.Download
+    description: "Download CSV from S3"
+    bucket: "{{ inputs.s3_bucket }}"
+    key: "{{ inputs.s3_key }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    region: "{{ secret('AWS_REGION') }}"
+
+  - id: create_table
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: "Create TimescaleDB table if not exists"
+    url: "jdbc:postgresql://postgres:5432/kestra_data"
+    username: "kestra_user"
+    password: "kestra_password"
+    sql: |
+      CREATE TABLE IF NOT EXISTS {{ inputs.table_name }} (
+        timestamp TIMESTAMPTZ,
+        device_id TEXT,
+        metric_name TEXT,
+        metric_value DOUBLE PRECISION,
+        location TEXT,
+        zone TEXT
+      );
+      SELECT create_hypertable('{{ inputs.table_name }}', 'timestamp', if_not_exists => TRUE);
+
+  - id: create_clickhouse_table_python
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Create ClickHouse table using Python HTTP API"
+    script: |
+      import urllib.request
+      import urllib.parse
+      import base64
+
+      clickhouse_host = "host.docker.internal" 
+      clickhouse_port = "8123"
+      username = "{{ secret('CLICKHOUSE_USER') }}"
+      password = "{{ secret('CLICKHOUSE_PASSWORD') }}"
+      database = "kestra_data"
+      table = "{{ inputs.table_name }}"
+
+      url = f"http://{clickhouse_host}:{clickhouse_port}/"
+      
+      create_db_query = f"CREATE DATABASE IF NOT EXISTS {database}"
+      params = urllib.parse.urlencode({'query': create_db_query})
+      full_url = f"{url}?{params}"
+      
+      req = urllib.request.Request(full_url, method='POST')
+      if password:
+          credentials = f"{username}:{password}"
+          encoded_credentials = base64.b64encode(credentials.encode()).decode()
+          req.add_header('Authorization', f'Basic {encoded_credentials}')
+      
+      try:
+          response = urllib.request.urlopen(req)
+          print(f"Database {database} created/verified successfully")
+      except Exception as e:
+          print(f"Error creating database: {e}")
+      
+      create_table_query = f"""
+      CREATE TABLE IF NOT EXISTS {database}.{table} (
+          timestamp DateTime64(3),
+          device_id String,
+          metric_name String,
+          metric_value Float64,
+          location String,
+          zone String
+      ) ENGINE = MergeTree()
+      ORDER BY (timestamp, device_id, metric_name)
+      PARTITION BY toYYYYMM(timestamp)
+      TTL timestamp + INTERVAL 1 YEAR
+      """
+      
+      params = urllib.parse.urlencode({'query': create_table_query})
+      full_url = f"{url}?{params}"
+      
+      req = urllib.request.Request(full_url, method='POST')
+      if password:
+          credentials = f"{username}:{password}"
+          encoded_credentials = base64.b64encode(credentials.encode()).decode()
+          req.add_header('Authorization', f'Basic {encoded_credentials}')
+      
+      try:
+          response = urllib.request.urlopen(req)
+          print(f"Table {table} created/verified successfully")
+          print("clickhouse_table_status=success")
+      except Exception as e:
+          print(f"Error creating table: {e}")
+          print("clickhouse_table_status=error")
+          print(f"clickhouse_table_error={str(e)}")
+
+  - id: copyin_data
+    type: io.kestra.plugin.jdbc.postgresql.CopyIn
+    description: "Insert CSV data into TimescaleDB"
+    url: "jdbc:postgresql://postgres:5432/kestra_data"
+    username: "kestra_user"
+    password: "kestra_password"
+    format: CSV
+    from: "{{ outputs.download_file.uri }}"
+    table: "{{ inputs.table_name }}"
+    header: true
+    delimiter: "{{ inputs.delimiter }}"
+    columns:
+      - timestamp
+      - device_id
+      - metric_name
+      - metric_value
+      - location
+      - zone
+
+  - id: clickhouse_insert_python
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Insert CSV data into ClickHouse using Python HTTP API"
+    script: |
+      import csv
+      import urllib.request
+      import urllib.parse
+      import base64
+      from pathlib import Path
+      from datetime import datetime
+      
+      clickhouse_host = "host.docker.internal"  # Docker host from Python container
+      clickhouse_port = "8123"
+      username = "{{ secret('CLICKHOUSE_USER') }}"
+      password = "{{ secret('CLICKHOUSE_PASSWORD') }}"
+      database = "kestra_data"
+      table = "{{ inputs.table_name }}"
+      batch_size = 1000
+      
+      def insert_batch(batch_data, db, tbl, host, port, user, pwd):
+          """Insert a batch of data into ClickHouse"""
+          try:
+              url = f"http://{host}:{port}/"
+              
+              insert_query = f"INSERT INTO {db}.{tbl} (timestamp, device_id, metric_name, metric_value, location, zone) VALUES"
+              
+              values_str = ""
+              for row in batch_data:
+                  values_str += f"('{row[0]}', '{row[1]}', '{row[2]}', {row[3]}, '{row[4]}', '{row[5]}'),"
+              
+              values_str = values_str.rstrip(',')
+              full_query = f"{insert_query} {values_str}"
+              
+              params = urllib.parse.urlencode({'query': full_query})
+              full_url = f"{url}?{params}"
+              
+              req = urllib.request.Request(full_url, method='POST')
+              if pwd:
+                  credentials = f"{user}:{pwd}"
+                  encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                  req.add_header('Authorization', f'Basic {encoded_credentials}')
+              
+              print(f"Successfully inserted batch of {len(batch_data)} rows")
+              return True
+              
+          except Exception as e:
+              print(f"Error inserting batch: {e}")
+              return False
+      
+      csv_path = "{{ outputs.download_file.uri }}"
+      
+      total_rows = 0
+      successful_inserts = 0
+      
+      with open(csv_path, 'r', encoding='utf-8') as file:
+          reader = csv.DictReader(file, delimiter='{{ inputs.delimiter }}')
+          
+          batch = []
+          for row in reader:
+              total_rows += 1
+              
+              try:
+                  timestamp = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
+                  timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+              except:
+                  timestamp_str = row['timestamp']
+              
+              batch.append([
+                  timestamp_str,
+                  row['device_id'],
+                  row['metric_name'],
+                  float(row['metric_value']),
+                  row['location'],
+                  row['zone']
+              ])
+              
+              if len(batch) >= batch_size:
+                  if insert_batch(batch, database, table, clickhouse_host, clickhouse_port, username, password):
+                      successful_inserts += len(batch)
+                  batch = []
+                  print(f"Processed {total_rows} rows so far...")
+          
+          if batch:
+              if insert_batch(batch, database, table, clickhouse_host, clickhouse_port, username, password):
+                  successful_inserts += len(batch)
+      
+      print(f"Total rows processed: {total_rows}")
+      print(f"Successfully inserted: {successful_inserts}")
+      
+      print(f"clickhouse_rows_inserted={successful_inserts}")
+      print("clickhouse_status=success" if successful_inserts > 0 else "clickhouse_status=error")
+      if successful_inserts == 0:
+          print("clickhouse_error=No rows were inserted successfully")
+
+  - id: es_bulk_load_python
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Bulk load CSV data into Elasticsearch using Python"
+    script: |
+      import csv
+      import json
+      import urllib.request
+      import urllib.parse
+      import base64
+      from datetime import datetime
+      
+      es_host = "host.docker.internal"  # Docker host from Python container
+      es_port = "9200"
+      username = "{{ secret('ES_USER') }}"
+      password = "{{ secret('ES_PASSWORD') }}"
+      index_name = "{{ inputs.table_name }}"
+      
+      csv_path = "{{ outputs.download_file.uri }}"
+      
+      def create_index_if_not_exists():
+          """Create Elasticsearch index if it doesn't exist"""
+          try:
+              url = f"http://{es_host}:{es_port}/{index_name}"
+              req = urllib.request.Request(url, method='HEAD')
+              if password:
+                  credentials = f"{username}:{password}"
+                  encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                  req.add_header('Authorization', f'Basic {encoded_credentials}')
+              
+              response = urllib.request.urlopen(req)
+              print(f"Index {index_name} already exists")
+              return True
+          except urllib.error.HTTPError as e:
+              if e.code == 404:
+                  try:
+                      create_url = f"http://{es_host}:{es_port}/{index_name}"
+                      mapping = {
+                          "mappings": {
+                              "properties": {
+                                  "timestamp": {"type": "date"},
+                                  "device_id": {"type": "keyword"},
+                                  "metric_name": {"type": "keyword"},
+                                  "metric_value": {"type": "float"},
+                                  "location": {"type": "keyword"},
+                                  "zone": {"type": "keyword"}
+                              }
+                          }
+                      }
+                      
+                      req = urllib.request.Request(create_url, method='PUT')
+                      req.add_header('Content-Type', 'application/json')
+                      if password:
+                          credentials = f"{username}:{password}"
+                          encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                          req.add_header('Authorization', f'Basic {encoded_credentials}')
+                      
+                      urllib.request.urlopen(req, data=json.dumps(mapping).encode())
+                      print(f"Index {index_name} created successfully")
+                      return True
+                  except Exception as create_e:
+                      print(f"Error creating index: {create_e}")
+                      return False
+              else:
+                  print(f"Error checking index: {e}")
+                  return False
+          except Exception as e:
+              print(f"Error checking index: {e}")
+              return False
+      
+      def bulk_index_batch(batch_data):
+          """Bulk index a batch of documents"""
+          try:
+              url = f"http://{es_host}:{es_port}/_bulk"
+              
+              bulk_body = ""
+              for doc in batch_data:
+                  bulk_body += json.dumps({"index": {"_index": index_name}}) + "\n"
+                  bulk_body += json.dumps(doc) + "\n"
+              
+              req = urllib.request.Request(url, method='POST')
+              req.add_header('Content-Type', 'application/x-ndjson')
+              if password:
+                  credentials = f"{username}:{password}"
+                  encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                  req.add_header('Authorization', f'Basic {encoded_credentials}')
+              
+              response = urllib.request.urlopen(req, data=bulk_body.encode())
+              result = json.loads(response.read().decode())
+              
+              if result.get('errors', False):
+                  print(f"Bulk indexing errors: {result}")
+                  return False
+              else:
+                  print(f"Successfully indexed batch of {len(batch_data)} documents")
+                  return True
+          except Exception as e:
+              print(f"Error bulk indexing batch: {e}")
+              return False
+      
+      if not create_index_if_not_exists():
+          print("es_status=error")
+          print("es_error=Failed to create index")
+          exit(1)
+      
+      batch_size = 1000
+      total_rows = 0
+      successful_indexes = 0
+      
+      with open(csv_path, 'r', encoding='utf-8') as file:
+          reader = csv.DictReader(file, delimiter='{{ inputs.delimiter }}')
+          
+          batch = []
+          for row in reader:
+              total_rows += 1
+              
+              try:
+                  timestamp = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
+                  timestamp_str = timestamp.isoformat()
+              except:
+                  timestamp_str = row['timestamp']
+              
+              doc = {
+                  "timestamp": timestamp_str,
+                  "device_id": row['device_id'],
+                  "metric_name": row['metric_name'],
+                  "metric_value": float(row['metric_value']),
+                  "location": row['location'],
+                  "zone": row['zone']
+              }
+              
+              batch.append(doc)
+              
+              if len(batch) >= batch_size:
+                  if bulk_index_batch(batch):
+                      successful_indexes += len(batch)
+                  batch = []
+                  print(f"Processed {total_rows} rows so far...")
+          
+          if batch:
+              if bulk_index_batch(batch):
+                  successful_indexes += len(batch)
+      
+      print(f"Total rows processed: {total_rows}")
+      print(f"Successfully indexed: {successful_indexes}")
+      
+      print(f"es_rows_indexed={successful_indexes}")
+      print("es_status=success" if successful_indexes > 0 else "es_status=error")
+      if successful_indexes == 0:
+          print("es_error=No documents were indexed successfully")
+
+  - id: log_success
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Successfully imported into TimescaleDB, ClickHouse, and Elasticsearch.
+      TimescaleDB: {{ outputs.copyin_data.outputs.rowsAffected }} rows
+      ClickHouse Table: {{ outputs.create_clickhouse_table_python.outputs.clickhouse_table_status }}
+      ClickHouse Data: {{ outputs.clickhouse_insert_python.outputs.clickhouse_rows_inserted }} rows
+      ClickHouse Status: {{ outputs.clickhouse_insert_python.outputs.clickhouse_status }}
+      Elasticsearch: {{ outputs.es_bulk_load_python.outputs.es_rows_indexed }} documents
+      Elasticsearch Status: {{ outputs.es_bulk_load_python.outputs.es_status }}
+
+  - id: cleanup
+    type: io.kestra.plugin.core.storage.Delete
+    uri: "{{ outputs.download_file.uri }}"
+
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 */6 * * *"
+    description: "Every 6 hours"
+
+errors:
+  - id: error_handler
+    type: io.kestra.plugin.core.log.Log
+    message: "Error processing CSV: {{ error.message }}"

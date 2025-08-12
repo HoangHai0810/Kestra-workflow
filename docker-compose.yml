@@ -1,0 +1,166 @@
+volumes:
+  postgres-data:
+    driver: local
+  kestra-data:
+    driver: local
+  postgres-config:
+    driver: local
+  clickhouse-data:
+    driver: local
+  elasticsearch-data:
+    driver: local
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - postgres-config:/etc/postgresql/postgresql.conf
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-kestra_data}
+      POSTGRES_USER: ${POSTGRES_USER:-kestra_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kestra_password}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    command: >
+      postgres
+      -c shared_preload_libraries=timescaledb
+      -c max_connections=100
+      -c shared_buffers=256MB
+      -c effective_cache_size=1GB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=4MB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  kestra:
+    image: kestra/kestra:latest
+    pull_policy: always
+    user: "root"
+    command: server standalone
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+    environment:
+      SECRET_AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID_B64}"
+      SECRET_AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY_B64}"
+      SECRET_AWS_REGION: "${AWS_REGION_B64}"
+      SECRET_CLICKHOUSE_USER: "${CLICKHOUSE_USER_B64}"
+      SECRET_CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD_B64}"
+      SECRET_ES_USER: "${ES_USER_B64}"
+      SECRET_ES_PASSWORD: "${ES_PASSWORD_B64}"
+      KESTRA_CONFIGURATION: |
+        dependencies:
+          clickhouse:
+            exclude:
+              - "org.apache.httpcomponents:httpclient"
+              - "org.apache.httpcomponents:httpcore"
+            include:
+              - "org.apache.httpcomponents:httpclient:4.5.14"
+              - "org.apache.httpcomponents:httpcore:4.4.16"
+        
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-kestra_data}
+            driverClassName: org.postgresql.Driver
+            username: ${POSTGRES_USER:-kestra_user}
+            password: ${POSTGRES_PASSWORD:-kestra_password}
+            hikari:
+              maximumPoolSize: ${POSTGRES_MAX_POOL_SIZE:-20}
+              minimumIdle: ${POSTGRES_MIN_IDLE:-5}
+              connectionTimeout: ${POSTGRES_CONNECTION_TIMEOUT:-30000}
+              idleTimeout: ${POSTGRES_IDLE_TIMEOUT:-600000}
+              maxLifetime: ${POSTGRES_MAX_LIFETIME:-1800000}
+        clickhouse:
+          url: jdbc:clickhouse://clickhouse:8123/kestra_data
+          driverClassName: com.clickhouse.jdbc.ClickHouseDriver
+          username: admin
+          password: admin123
+          hikari:
+            maximumPoolSize: ${CLICKHOUSE_MAX_POOL_SIZE:-20}
+            minimumIdle: ${CLICKHOUSE_MIN_IDLE:-5}
+            connectionTimeout: ${CLICKHOUSE_CONNECTION_TIMEOUT:-30000}
+            idleTimeout: ${CLICKHOUSE_IDLE_TIMEOUT:-600000}
+            maxLifetime: ${CLICKHOUSE_MAX_LIFETIME:-1800000}
+        kestra:
+          server:
+            basicAuth:
+              enabled: true
+              username: ${KESTRA_USERNAME:-admin}
+              password: ${KESTRA_PASSWORD:-admin}
+          repository:
+            type: postgres
+          secrets:
+            type: env
+            env:
+              prefix: "SECRET_"
+          storage:
+            type: local
+            local:
+              basePath: "/app/storage"
+          queue:
+            type: postgres
+          tasks:
+            tmpDir:
+              path: /tmp/kestra-wd/tmp
+          url: http://localhost:${KESTRA_PORT:-8080}/
+    ports:
+      - "${KESTRA_PORT:-8080}:8080"
+      - "${PROMETHEUS_PORT:-8081}:8081"
+    depends_on:
+      postgres:
+        condition: service_started
+      clickhouse:
+        condition: service_started
+      elasticsearch:
+        condition: service_started
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: kestra_data
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin123
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "${CLICKHOUSE_PORT:-8123}:8123"
+      - "${CLICKHOUSE_HTTP_PORT:-9000}:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - ELASTIC_PASSWORD=elastic123
+    ports:
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
+      - "${ELASTICSEARCH_TRANSPORT_PORT:-9300}:9300"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
