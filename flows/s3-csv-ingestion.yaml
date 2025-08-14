@@ -55,7 +55,7 @@ tasks:
           import urllib.parse
           import base64
 
-          clickhouse_host = "host.docker.internal" 
+          clickhouse_host = "host.docker.internal"
           clickhouse_port = "8123"
           username = "{{ secret('CLICKHOUSE_USER') }}"
           password = "{{ secret('CLICKHOUSE_PASSWORD') }}"
@@ -93,7 +93,6 @@ tasks:
           PARTITION BY toYYYYMM(timestamp)
           TTL timestamp + INTERVAL 1 YEAR
           """
-          
           params = urllib.parse.urlencode({'query': create_table_query})
           full_url = f"{url}?{params}"
           
@@ -106,11 +105,75 @@ tasks:
           try:
               response = urllib.request.urlopen(req)
               print(f"Table {table} created/verified successfully")
-              print("clickhouse_table_status=success")
           except Exception as e:
               print(f"Error creating table: {e}")
-              print("clickhouse_table_status=error")
-              print(f"clickhouse_table_error={str(e)}")
+
+      - id: create_elasticsearch_index
+        type: io.kestra.plugin.scripts.python.Script
+        description: "Create Elasticsearch index if not exists"
+        script: |
+          import urllib.request
+          import json
+          import base64
+
+          es_host = "host.docker.internal"
+          es_port = "9200"
+          username = "{{ secret('ES_USER') }}"
+          password = "{{ secret('ES_PASSWORD') }}"
+          index_name = "{{ inputs.table_name }}"
+
+          def create_index_if_not_exists():
+              """Create Elasticsearch index if it doesn't exist"""
+              try:
+                  url = f"http://{es_host}:{es_port}/{index_name}"
+                  req = urllib.request.Request(url, method='HEAD')
+                  if password:
+                      credentials = f"{username}:{password}"
+                      encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                      req.add_header('Authorization', f'Basic {encoded_credentials}')
+                      
+                  try:
+                      response = urllib.request.urlopen(req)
+                      print(f"Index {index_name} already exists")
+                      return True
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404:
+                          create_url = f"http://{es_host}:{es_port}/{index_name}"
+                          mapping = {
+                              "mappings": {
+                                  "properties": {
+                                      "timestamp": {"type": "date"},
+                                      "device_id": {"type": "keyword"},
+                                      "metric_name": {"type": "keyword"},
+                                      "metric_value": {"type": "float"},
+                                      "location": {"type": "keyword"},
+                                      "zone": {"type": "keyword"}
+                                  }
+                              }
+                          }
+                          
+                          req = urllib.request.Request(create_url, method='PUT')
+                          req.add_header('Content-Type', 'application/json')
+                          if password:
+                              credentials = f"{username}:{password}"
+                              encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                              req.add_header('Authorization', f'Basic {encoded_credentials}')
+                          
+                          urllib.request.urlopen(req, data=json.dumps(mapping).encode())
+                          print(f"Index {index_name} created successfully")
+                          return True
+                      else:
+                          print(f"Error checking index: {e}")
+                          return False
+              except Exception as e:
+                  print(f"Error creating index: {e}")
+                  return False
+
+          if create_index_if_not_exists():
+              print("elasticsearch_index_status=success")
+          else:
+              print("elasticsearch_index_status=error")
+              print("elasticsearch_index_error=Failed to create index") 
 
       - id: create_qdrant_collection
         type: io.kestra.plugin.scripts.python.Script
@@ -126,9 +189,7 @@ tasks:
           def create_collection_if_not_exists():
               """Create Qdrant collection if it doesn't exist"""
               try:
-                  # Check if collection exists
                   url = f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}"
-                  print(f"Checking collection at: {url}")
                   req = urllib.request.Request(url, method='GET')
                   
                   try:
@@ -137,23 +198,16 @@ tasks:
                       return True
                   except urllib.error.HTTPError as e:
                       if e.code == 404:
-                          # Create collection - use correct API endpoint
                           create_url = f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}"
-                          print(f"Creating collection at: {create_url}")
-                          
                           collection_config = {
                               "vectors": {
-                                  "size": 6,  # 6 dimensions for our metrics
+                                  "size": 6,
                                   "distance": "Cosine"
                               },
                               "on_disk_payload": True
                           }
-                          
-                          print(f"Collection config: {json.dumps(collection_config, indent=2)}")
-                          
                           req = urllib.request.Request(create_url, method='PUT')
                           req.add_header('Content-Type', 'application/json')
-                          
                           response = urllib.request.urlopen(req, data=json.dumps(collection_config).encode())
                           print(f"Collection {collection_name} created successfully")
                           return True
@@ -162,7 +216,6 @@ tasks:
                           return False
               except Exception as e:
                   print(f"Error creating collection: {e}")
-                  print(f"Full error details: {type(e).__name__}: {str(e)}")
                   return False
 
           if create_collection_if_not_exists():
@@ -202,10 +255,11 @@ tasks:
           import urllib.request
           import urllib.parse
           import base64
+          import json
           from pathlib import Path
           from datetime import datetime
           
-          clickhouse_host = "host.docker.internal"  # Docker host from Python container
+          clickhouse_host = "host.docker.internal"
           clickhouse_port = "8123"
           username = "{{ secret('CLICKHOUSE_USER') }}"
           password = "{{ secret('CLICKHOUSE_PASSWORD') }}"
@@ -220,12 +274,20 @@ tasks:
                   
                   insert_query = f"INSERT INTO {db}.{tbl} (timestamp, device_id, metric_name, metric_value, location, zone) VALUES"
                   
-                  values_str = ""
+                  values_list = []
                   for row in batch_data:
-                      values_str += f"('{row[0]}', '{row[1]}', '{row[2]}', {row[3]}, '{row[4]}', '{row[5]}'),"
+                      timestamp = str(row[0]).replace("'", "''")
+                      device_id = str(row[1]).replace("'", "''")
+                      metric_name = str(row[2]).replace("'", "''")
+                      metric_value = float(row[3])
+                      location = str(row[4]).replace("'", "''")
+                      zone = str(row[5]).replace("'", "''")
+                      
+                      values_list.append(f"('{timestamp}', '{device_id}', '{metric_name}', {metric_value}, '{location}', '{zone}')")
                   
-                  values_str = values_str.rstrip(',')
+                  values_str = ",".join(values_list)
                   full_query = f"{insert_query} {values_str}"
+                
                   
                   params = urllib.parse.urlencode({'query': full_query})
                   full_url = f"{url}?{params}"
@@ -236,11 +298,27 @@ tasks:
                       encoded_credentials = base64.b64encode(credentials.encode()).decode()
                       req.add_header('Authorization', f'Basic {encoded_credentials}')
                   
-                  print(f"Successfully inserted batch of {len(batch_data)} rows")
-                  return True
+                  response = urllib.request.urlopen(req)
+                  response_text = response.read().decode()
                   
+                  if response.getcode() == 200:
+                      print(f"Successfully inserted batch of {len(batch_data)} rows")
+                      if response_text:
+                          print(f"Response: {response_text}")
+                      return True
+                  else:
+                      print(f"Failed to insert batch: HTTP {response.getcode()}")
+                      print(f"Response: {response_text}")
+                      return False
+                      
               except Exception as e:
                   print(f"Error inserting batch: {e}")
+                  if hasattr(e, 'read'):
+                      try:
+                          error_response = e.read().decode()
+                          print(f"Error response: {error_response}")
+                      except:
+                          pass
                   return False
           
           csv_path = "{{ outputs.download_file.uri }}"
@@ -249,25 +327,26 @@ tasks:
           successful_inserts = 0
           
           with open(csv_path, 'r', encoding='utf-8') as file:
-              reader = csv.DictReader(file, delimiter='{{ inputs.delimiter }}')
+              next(file)
+              reader = csv.reader(file, delimiter='{{ inputs.delimiter }}')
               
               batch = []
               for row in reader:
                   total_rows += 1
                   
                   try:
-                      timestamp = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
+                      timestamp = datetime.fromisoformat(row[0].replace('Z', '+00:00'))
                       timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
                   except:
-                      timestamp_str = row['timestamp']
+                      timestamp_str = row[0]
                   
                   batch.append([
                       timestamp_str,
-                      row['device_id'],
-                      row['metric_name'],
-                      float(row['metric_value']),
-                      row['location'],
-                      row['zone']
+                      row[1],  # device_id
+                      row[2],  # metric_name
+                      row[3],  # metric_value
+                      row[4],  # location
+                      row[5]   # zone
                   ])
                   
                   if len(batch) >= batch_size:
@@ -295,148 +374,149 @@ tasks:
           import csv
           import json
           import urllib.request
-          import urllib.parse
           import base64
           from datetime import datetime
-          
-          es_host = "host.docker.internal"  # Docker host from Python container
+
+          es_host = "host.docker.internal"
           es_port = "9200"
           username = "{{ secret('ES_USER') }}"
           password = "{{ secret('ES_PASSWORD') }}"
           index_name = "{{ inputs.table_name }}"
-          
           csv_path = "{{ outputs.download_file.uri }}"
-          
-          def create_index_if_not_exists():
-              """Create Elasticsearch index if it doesn't exist"""
+
+          def create_document(doc_id, row_data):
+              """Create Elasticsearch document from CSV row"""
               try:
-                  url = f"http://{es_host}:{es_port}/{index_name}"
-                  req = urllib.request.Request(url, method='HEAD')
-                  if password:
-                      credentials = f"{username}:{password}"
-                      encoded_credentials = base64.b64encode(credentials.encode()).decode()
-                      req.add_header('Authorization', f'Basic {encoded_credentials}')
-                      
-                  response = urllib.request.urlopen(req)
-                  print(f"Index {index_name} already exists")
-                  return True
-              except urllib.error.HTTPError as e:
-                  if e.code == 404:
-                      try:
-                          create_url = f"http://{es_host}:{es_port}/{index_name}"
-                          mapping = {
-                              "mappings": {
-                                  "properties": {
-                                      "timestamp": {"type": "date"},
-                                      "device_id": {"type": "keyword"},
-                                      "metric_name": {"type": "keyword"},
-                                      "metric_value": {"type": "float"},
-                                      "location": {"type": "keyword"},
-                                      "zone": {"type": "keyword"}
-                                  }
-                              }
-                          }
-                          
-                          req = urllib.request.Request(create_url, method='PUT')
-                          req.add_header('Content-Type', 'application/json')
-                          if password:
-                              credentials = f"{username}:{password}"
-                              encoded_credentials = base64.b64encode(credentials.encode()).decode()
-                              req.add_header('Authorization', f'Basic {encoded_credentials}')
-                          
-                          urllib.request.urlopen(req, data=json.dumps(mapping).encode())
-                          print(f"Index {index_name} created successfully")
-                          return True
-                      except Exception as create_e:
-                          print(f"Error creating index: {create_e}")
-                          return False
-                  else:
-                      print(f"Error checking index: {e}")
-                      return False
+                  timestamp_str = row_data['timestamp']
+                  try:
+                      if 'T' in timestamp_str and 'Z' in timestamp_str:
+                          timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                          timestamp_str = timestamp.isoformat()
+                  except Exception as e:
+                          pass
+
+                  doc = {
+                      "timestamp": timestamp_str,
+                      "device_id": row_data['device_id'],
+                      "metric_name": row_data['metric_name'],
+                      "metric_value": float(row_data['metric_value']),
+                      "location": row_data['location'],
+                      "zone": row_data['zone']
+                  }
+                  return doc
               except Exception as e:
-                  print(f"Error checking index: {e}")
-                  return False
-          
-          def bulk_index_batch(batch_data):
-              """Bulk index a batch of documents"""
+                  print(f"Error creating document from row: {e}")
+                  return None
+
+          def bulk_insert(documents, batch_size=1000):
+              """Insert documents in bulk"""
               try:
+                  if not documents:
+                      return 0
+
+                  bulk_data = ""
+                  for doc in documents:
+                      index_action = {
+                          "index": {
+                              "_index": index_name,
+                              "_id": f"{doc['device_id']}_{doc['metric_name']}_{doc['timestamp']}"
+                          }
+                      }
+                      bulk_data += json.dumps(index_action) + "\n"
+                      
+                      bulk_data += json.dumps(doc) + "\n"
+
                   url = f"http://{es_host}:{es_port}/_bulk"
-                  
-                  bulk_body = ""
-                  for doc in batch_data:
-                      bulk_body += json.dumps({"index": {"_index": index_name}}) + "\n"
-                      bulk_body += json.dumps(doc) + "\n"
-                  
-                  req = urllib.request.Request(url, method='POST')
+                  req = urllib.request.Request(url, method='POST', data=bulk_data.encode('utf-8'))
                   req.add_header('Content-Type', 'application/x-ndjson')
+                  
                   if password:
                       credentials = f"{username}:{password}"
                       encoded_credentials = base64.b64encode(credentials.encode()).decode()
                       req.add_header('Authorization', f'Basic {encoded_credentials}')
-                  
-                  response = urllib.request.urlopen(req, data=bulk_body.encode())
+
+                  response = urllib.request.urlopen(req)
                   result = json.loads(response.read().decode())
                   
-                  if result.get('errors', False):
-                      print(f"Bulk indexing errors: {result}")
-                      return False
+                  if result.get('errors', True):
+                      print(f"Bulk insert errors: {result}")
+                      return 0
                   else:
-                      print(f"Successfully indexed batch of {len(batch_data)} documents")
-                      return True
+                      print(f"Successfully inserted {len(documents)} documents")
+                      return len(documents)
+                      
               except Exception as e:
-                  print(f"Error bulk indexing batch: {e}")
-                  return False
-          
-          if not create_index_if_not_exists():
-              print("es_status=error")
-              print("es_error=Failed to create index")
+                  print(f"Error in bulk insert: {e}")
+                  return 0
+
+          try:
+              url = f"http://{es_host}:{es_port}/{index_name}"
+              req = urllib.request.Request(url, method='HEAD')
+              if password:
+                  credentials = f"{username}:{password}"
+                  encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                  req.add_header('Authorization', f'Basic {encoded_credentials}')
+
+              response = urllib.request.urlopen(req)
+              print(f"Index {index_name} verified successfully")
+          except Exception as e:
+              print(f"elasticsearch_status=error")
+              print(f"elasticsearch_error=Index {index_name} not found: {e}")
               exit(1)
-          
-          batch_size = 10000
+                      
+          try:
+              url = f"http://{es_host}:{es_port}/{index_name}"
+              req = urllib.request.Request(url, method='GET')
+              response = urllib.request.urlopen(req)
+              print(f"Index {index_name} verified successfully")
+              print(f"elasticsearch_index_status=success")
+          except Exception as e:
+              print(f"elasticsearch_index_status=error")
+              print(f"elasticsearch_index_error=Index {index_name} not found: {e}")
+              exit(1)
+
           total_rows = 0
-          successful_indexes = 0
-          
+          successful_inserts = 0
+          batch_size = 1000
+
           with open(csv_path, 'r', encoding='utf-8') as file:
-              reader = csv.DictReader(file, delimiter='{{ inputs.delimiter }}')
+              next(file)
+              reader = csv.reader(file, delimiter='{{ inputs.delimiter }}')
               
               batch = []
               for row in reader:
                   total_rows += 1
                   
-                  try:
-                      timestamp = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
-                      timestamp_str = timestamp.isoformat()
-                  except:
-                      timestamp_str = row['timestamp']
-                  
-                  doc = {
-                      "timestamp": timestamp_str,
-                      "device_id": row['device_id'],
-                      "metric_name": row['metric_name'],
-                      "metric_value": float(row['metric_value']),
-                      "location": row['location'],
-                      "zone": row['zone']
+                  row_dict = {
+                      'timestamp': row[0],
+                      'device_id': row[1],
+                      'metric_name': row[2],
+                      'metric_value': row[3],
+                      'location': row[4],
+                      'zone': row[5]
                   }
                   
-                  batch.append(doc)
+                  doc = create_document(total_rows, row_dict)
+                  if doc:
+                      batch.append(doc)
                   
                   if len(batch) >= batch_size:
-                      if bulk_index_batch(batch):
-                          successful_indexes += len(batch)
+                      if bulk_insert(batch, batch_size):
+                          successful_inserts += len(batch)
                       batch = []
                       print(f"Processed {total_rows} rows so far...")
               
               if batch:
-                  if bulk_index_batch(batch):
-                      successful_indexes += len(batch)
-          
+                  if bulk_insert(batch, batch_size):
+                      successful_inserts += len(batch)
+
           print(f"Total rows processed: {total_rows}")
-          print(f"Successfully indexed: {successful_indexes}")
+          print(f"Successfully inserted: {successful_inserts}")
           
-          print(f"es_rows_indexed={successful_indexes}")
-          print("es_status=success" if successful_indexes > 0 else "es_status=error")
-          if successful_indexes == 0:
-              print("es_error=No documents were inserted successfully")
+          print(f"elasticsearch_documents_inserted={successful_inserts}")
+          print("elasticsearch_status=success" if successful_inserts > 0 else "elasticsearch_status=error")
+          if successful_inserts == 0:
+              print("elasticsearch_error=No documents were inserted successfully")
 
       - id: copy_data_to_qdrant
         type: io.kestra.plugin.scripts.python.Script
@@ -445,70 +525,30 @@ tasks:
           import csv
           import json
           import urllib.request
-          import urllib.parse
           import hashlib
           from datetime import datetime
-          
-          qdrant_host = "qdrant"  # Use service name in Docker network
+
+          qdrant_host = "host.docker.internal"
           qdrant_port = "6333"
           collection_name = "{{ inputs.table_name }}"
-          
           csv_path = "{{ outputs.download_file.uri }}"
-          
-          def create_collection_if_not_exists():
-              """Create Qdrant collection if it doesn't exist"""
-              try:
-                  # Check if collection exists
-                  url = f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}"
-                  req = urllib.request.Request(url, method='GET')
-                  
-                  try:
-                      response = urllib.request.urlopen(req)
-                      print(f"Collection {collection_name} already exists")
-                      return True
-                  except urllib.error.HTTPError as e:
-                      if e.code == 404:
-                          # Create collection
-                          create_url = f"http://{qdrant_host}:{qdrant_port}/collections"
-                          collection_config = {
-                              "vectors": {
-                                  "size": 6,  # 6 dimensions for our metrics
-                                  "distance": "Cosine"
-                              },
-                              "on_disk_payload": True
-                          }
-                          
-                          req = urllib.request.Request(create_url, method='PUT')
-                          req.add_header('Content-Type', 'application/json')
-                          
-                          urllib.request.urlopen(req, data=json.dumps(collection_config).encode())
-                          print(f"Collection {collection_name} created successfully")
-                          return True
-                      else:
-                          print(f"Error checking collection: {e}")
-                          return False
-              except Exception as e:
-                  print(f"Error creating collection: {e}")
-                  return False
-          
+
           def insert_batch(batch_data):
               """Insert a batch of points into Qdrant"""
               try:
                   url = f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}/points"
                   
                   points = []
-                  for i, row in enumerate(batch_data):
-                      # Create a unique ID for each point
+                  for row in batch_data:
                       point_id = hashlib.md5(f"{row['timestamp']}_{row['device_id']}_{row['metric_name']}".encode()).hexdigest()
                       
-                      # Convert metrics to vector (normalize values for better similarity search)
                       vector = [
-                          float(row['metric_value']) / 100.0,  # Normalize metric value
-                          hash(row['device_id']) % 100 / 100.0,  # Hash device_id to 0-1 range
-                          hash(row['metric_name']) % 100 / 100.0,  # Hash metric_name to 0-1 range
-                          hash(row['location']) % 100 / 100.0,  # Hash location to 0-1 range
-                          hash(row['zone']) % 100 / 100.0,  # Hash zone to 0-1 range
-                          float(row['timestamp'].split('T')[0].replace('-', '')) / 100000000.0  # Date as normalized value
+                          float(row['metric_value']) / 100.0,
+                          hash(row['device_id']) % 100 / 100.0,
+                          hash(row['metric_name']) % 100 / 100.0,
+                          hash(row['location']) % 100 / 100.0,
+                          hash(row['zone']) % 100 / 100.0,
+                          float(row['timestamp'].split('T')[0].replace('-', '')) / 100000000.0
                       ]
                       
                       point = {
@@ -544,6 +584,7 @@ tasks:
               except Exception as e:
                   print(f"Error inserting batch: {e}")
                   return False
+
           try:
               url = f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}"
               req = urllib.request.Request(url, method='GET')
@@ -553,31 +594,32 @@ tasks:
               print(f"qdrant_status=error")
               print(f"qdrant_error=Collection {collection_name} not found: {e}")
               exit(1)
-          
-          batch_size = 1000  # Smaller batch size for Qdrant
+
+          batch_size = 1000
           total_rows = 0
           successful_inserts = 0
-          
-          with open(csv_path, 'r', encoding='utf-8') as file:
-              reader = csv.DictReader(file, delimiter='{{ inputs.delimiter }}')
+
+          with open(csv_path, 'r', encoding='utf-8') as file: 
+              next(file)
+              reader = csv.reader(file, delimiter='{{ inputs.delimiter }}')
               
               batch = []
               for row in reader:
                   total_rows += 1
                   
                   try:
-                      timestamp = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
+                      timestamp = datetime.fromisoformat(row[0].replace('Z', '+00:00'))
                       timestamp_str = timestamp.isoformat()
                   except:
-                      timestamp_str = row['timestamp']
+                      timestamp_str = row[0]
                   
                   batch.append({
                       'timestamp': timestamp_str,
-                      'device_id': row['device_id'],
-                      'metric_name': row['metric_name'],
-                      'metric_value': row['metric_value'],
-                      'location': row['location'],
-                      'zone': row['zone']
+                      'device_id': row[1],
+                      'metric_name': row[2],
+                      'metric_value': row[3],
+                      'location': row[4],
+                      'zone': row[5]
                   })
                   
                   if len(batch) >= batch_size:
@@ -589,7 +631,7 @@ tasks:
               if batch:
                   if insert_batch(batch):
                       successful_inserts += len(batch)
-          
+
           print(f"Total rows processed: {total_rows}")
           print(f"Successfully inserted: {successful_inserts}")
           
@@ -611,4 +653,4 @@ triggers:
 errors:
   - id: error_handler
     type: io.kestra.plugin.core.log.Log
-    message: "Error processing CSV: {{ error.message }}"
+    message: "Flow failed. Check task logs for details."

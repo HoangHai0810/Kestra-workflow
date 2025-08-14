@@ -55,6 +55,7 @@ services:
       - kestra-data:/app/storage
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp/kestra-wd:/tmp/kestra-wd
+      - ./flows:/app/flows
     environment:
       SECRET_AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID_B64}"
       SECRET_AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY_B64}"
