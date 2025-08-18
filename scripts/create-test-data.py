@@ -153,15 +153,15 @@ def main():
     # Create different test files
     test_files = [
         {
-            'key': f'{s3_prefix}kestra-test/sample-metrics.csv',
+            'key': f'{s3_prefix}sample-metrics.csv',
             'description': 'Full dataset for testing'
         },
         {
-            'key': f'{s3_prefix}kestra-test/daily-metrics-2024-01-15.csv',
+            'key': f'{s3_prefix}daily-metrics-2024-01-15.csv',
             'description': 'Daily dataset for scheduled workflow testing'
         },
         {
-            'key': f'{s3_prefix}kestra-test/hourly-metrics-2024-01-15.csv',
+            'key': f'{s3_prefix}hourly-metrics-2024-01-15.csv',
             'description': 'Hourly dataset for smaller batch testing'
         }
     ]
@@ -200,7 +200,7 @@ def main():
     
     print("\n🔧 Workflow inputs:")
     print(f"   - s3_bucket: {s3_bucket}")
-    print(f"   - s3_key: {s3_prefix}kestra-test/sample-metrics.csv")
+    print(f"   - s3_key: {s3_prefix}sample-metrics.csv")
     print("   - table_name: test_metrics")
 
 if __name__ == "__main__":

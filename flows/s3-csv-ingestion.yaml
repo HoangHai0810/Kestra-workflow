@@ -20,8 +20,8 @@ tasks:
   - id: download_file
     type: io.kestra.plugin.aws.s3.Download
     description: "Download CSV from S3"
-    bucket: "{{ inputs.s3_bucket }}"
-    key: "{{ inputs.s3_key }}"
+    bucket: "{{ trigger.bucket | default(inputs.s3_bucket) }}"
+    key: "{{ trigger.key | default(inputs.s3_key) }}"
     accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
     secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
     region: "{{ secret('AWS_REGION') }}"
@@ -644,11 +644,27 @@ tasks:
     type: io.kestra.plugin.core.storage.Delete
     uri: "{{ outputs.download_file.uri }}"
 
+  - id: delete_source_s3_object
+    type: io.kestra.plugin.aws.s3.Delete
+    description: "Delete source S3 object after successful processing"
+    bucket: "{{ trigger.bucket | default(inputs.s3_bucket) }}"
+    key: "{{ trigger.key | default(inputs.s3_key) }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    region: "{{ secret('AWS_REGION') }}"
+
 triggers:
-  - id: schedule
-    type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 */6 * * *"
-    description: "Every 6 hours"
+  - id: delete_processed_files
+    type: io.kestra.plugin.aws.s3.Trigger
+    description: "Run when new CSV object is added to S3"
+    bucket: "{{ trigger.bucket | default(inputs.s3_bucket) }}"
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    region: "{{ secret('AWS_REGION') }}"
+    prefix: "resources/kestra-test/"
+    regexp: ".*\\.csv$"
+    interval: PT1M
+    action: NONE
 
 errors:
   - id: error_handler
