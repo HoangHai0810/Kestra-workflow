@@ -55,7 +55,7 @@ services:
       - kestra-data:/app/storage
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp/kestra-wd:/tmp/kestra-wd
-      - ./flows:/app/flows
+      - /Users/hoanghaianh/Kestra-workflow/flows:/app/flows
     environment:
       SECRET_AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID_B64}"
       SECRET_AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY_B64}"
@@ -64,6 +64,7 @@ services:
       SECRET_CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD_B64}"
       SECRET_ES_USER: "${ES_USER_B64}"
       SECRET_ES_PASSWORD: "${ES_PASSWORD_B64}"
+      SECRET_SEARCHAPI_API_KEY: "${SEARCHAPI_API_KEY_B64}"
       KESTRA_CONFIGURATION: |
         dependencies:
           clickhouse:
@@ -73,7 +74,12 @@ services:
             include:
               - "org.apache.httpcomponents:httpclient:4.5.14"
               - "org.apache.httpcomponents:httpcore:4.4.16"
-        
+        micronaut:
+          io:
+            watch:
+              enabled: true
+              paths:
+                - /app/flows
         datasources:
           postgres:
             url: jdbc:postgresql://postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-kestra_data}
@@ -101,10 +107,12 @@ services:
           server:
             basicAuth:
               enabled: true
-              username: ${KESTRA_USERNAME:-admin}
-              password: ${KESTRA_PASSWORD:-admin}
+              username: ${KESTRA_USERNAME:-hoanghaianh0810@gmail.com}
+              password: ${KESTRA_PASSWORD:-Haianh2003!!}
           repository:
             type: postgres
+          tutorialFlows:
+            enabled: false
           secrets:
             type: env
             env:

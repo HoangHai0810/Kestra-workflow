@@ -1,0 +1,216 @@
+id: auto-lens-api
+namespace: com.flowio
+description: "Automatically call SearchAPI.io Google Lens API every 5 minutes and save to S3"
+
+inputs:
+      - id: s3_bucket
+        type: STRING
+        defaults: "static-staging.flowio.app"
+      - id: s3_key_prefix
+        type: STRING
+        defaults: "resources/kestra_test/"
+      - id: image_urls
+        type: STRING
+        defaults: "https://www.phongcachxanh.vn/cdn/shop/files/ban-phim-c-melgeek-o2-1155939125.jpg?v=1744715612&width=1200,https://cdn.tgdd.vn/Products/Images/5697/321396/xiaomi-a27i-27-inch-fhd-thumb-600x600.jpg"
+      - id: table_name
+        type: STRING
+        defaults: "auto_lens_results"
+
+tasks:
+      - id: call_lens_api_for_images
+        type: io.kestra.plugin.scripts.python.Script
+        description: Call SearchAPI.io Google Lens API for multiple images and collect visual search results
+        taskRunner:
+            type: io.kestra.plugin.scripts.runner.docker.Docker
+        outputFiles:
+            - "*.json"
+        script: |
+            import subprocess
+            import sys
+            
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "Pillow"])
+            
+            import requests
+            import json
+            import os
+            from datetime import datetime
+            import time
+            
+            s3_bucket = "{{ inputs.s3_bucket }}"
+            s3_key_prefix = "{{ inputs.s3_key_prefix }}"
+            image_urls = "{{ inputs.image_urls }}".split(',')
+            table_name = "{{ inputs.table_name }}"
+            
+            SEARCHAPI_API_KEY = "{{ secret('SEARCHAPI_API_KEY') }}"
+            
+            def call_searchapi_lens_api(image_url, api_key):
+                try:
+                    print(f"Calling SearchAPI.io Google Lens API for: {image_url}")
+                    
+                    url = "https://www.searchapi.io/api/v1/search"
+                    
+                    params = {
+                        'engine': 'google_lens',
+                        'search_type': 'all',
+                        'url': image_url,
+                        'hl': 'en',
+                        'country': 'US',
+                        'device': 'desktop',
+                        'safe_search': 'blur'
+                    }
+                    
+                    headers = {
+                        'Authorization': f'Bearer {api_key}',
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    response = requests.get(url, params=params, headers=headers, timeout=60)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        print(f"SearchAPI.io Google Lens API call successful")
+                        return data
+                    else:
+                        error_data = response.json() if response.text else {}
+                        print(f"SearchAPI.io Google Lens API error: HTTP {response.status_code}")
+                        print(f"Error details: {error_data}")
+                        return None
+                        
+                except Exception as e:
+                    print(f"Error calling SearchAPI.io Google Lens API: {e}")
+                    return None
+            
+            def call_searchapi_lens_api_with_query(image_url, query, api_key):
+                try:
+                    print(f"Calling SearchAPI.io Google Lens API with query '{query}' for: {image_url}")
+                    
+                    url = "https://www.searchapi.io/api/v1/search"
+                    
+                    params = {
+                        'engine': 'google_lens',
+                        'search_type': 'products',
+                        'q': query,
+                        'url': image_url,
+                        'hl': 'en',
+                        'country': 'US',
+                        'device': 'desktop',
+                        'safe_search': 'blur'
+                    }
+                    
+                    headers = {
+                        'Authorization': f'Bearer {api_key}',
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    response = requests.get(url, params=params, headers=headers, timeout=60)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        print(f"SearchAPI.io Google Lens API with query successful")
+                        return data
+                    else:
+                        error_data = response.json() if response.text else {}
+                        print(f"SearchAPI.io Google Lens API with query error: HTTP {response.status_code}")
+                        print(f"Error details: {error_data}")
+                        return None
+                        
+                except Exception as e:
+                    print(f"Error calling SearchAPI.io Google Lens API with query: {e}")
+                    return None
+            
+            all_results = []
+            successful_images = 0
+            
+            for i, image_url in enumerate(image_urls):
+                try:
+                    print(f"Processing image {i+1}/{len(image_urls)}: {image_url}")
+                    
+                    api_response = call_searchapi_lens_api(image_url.strip(), SEARCHAPI_API_KEY)
+                    
+                    if not api_response:
+                        print(f"No results found, trying with generic query")
+                        api_response = call_searchapi_lens_api_with_query(image_url.strip(), "product", SEARCHAPI_API_KEY)
+                    
+                    if not api_response:
+                        print(f"Failed to get results for: {image_url}")
+                        continue
+                    
+                    all_results.append({
+                        "timestamp": datetime.now().isoformat(),
+                        "source_image_url": image_url.strip(),
+                        "api_response": api_response
+                    })
+                    successful_images += 1
+                    
+                    if i < len(image_urls) - 1:
+                        print("Rate limiting: waiting 3 seconds...")
+                        time.sleep(3)
+                    
+                except Exception as e:
+                    print(f"Error processing image {image_url}: {e}")
+                    continue
+            
+            if not all_results:
+                print("No results to save")
+                print("lens_api_status=error")
+                exit(1)
+            
+            json_filename = "lens_results.json"
+            
+            try:
+                with open(json_filename, 'w', encoding='utf-8') as jsonfile:
+                    json.dump(all_results, jsonfile, indent=4, ensure_ascii=False)
+                
+                if os.path.exists(json_filename):
+                    file_size = os.path.getsize(json_filename)
+                    print(f"JSON file created successfully: {json_filename} (size: {file_size} bytes)")
+                else:
+                    print(f"JSON file was not created: {json_filename}")
+                
+                print("Files in current directory:")
+                for file in os.listdir('.'):
+                    print(f"  - {file}")
+                    
+            except Exception as e:
+                print(f"Error creating JSON file: {e}")
+                import traceback
+                traceback.print_exc()
+
+            print(f"lens_api_status=success")
+            print(f"lens_images_processed={successful_images}")
+            print(f"lens_total_results={len(all_results)}")
+            print(f"lens_timestamp={datetime.now().isoformat()}")
+
+            print(f"::total_results::{len(all_results)}")
+            print(f"::successful_images::{successful_images}")
+            print(f"::timestamp::{datetime.now().isoformat()}")
+
+      - id: upload_to_s3
+        type: io.kestra.plugin.aws.s3.Upload
+        description: Upload SearchAPI.io Google Lens API results to S3
+        bucket: "{{ inputs.s3_bucket }}"
+        key: "{{ inputs.s3_key_prefix }}auto_lens_results_{{ now() | date('yyyyMMdd_HHmmss') }}.json"
+        from: "{{ outputs.call_lens_api_for_images.outputFiles['lens_results.json'] }}"
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "{{ secret('AWS_REGION') }}"
+
+      - id: log_completion
+        type: io.kestra.plugin.core.log.Log
+        message: Auto SearchAPI.io Google Lens API workflow completed. Results uploaded to S3.
+
+triggers:
+  - id: auto_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+    description: Automatically run SearchAPI.io Google Lens API analysis every 5 minutes
+
+  - id: manual_trigger
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: auto-lens-api
+    description: Manual trigger for testing
+
+errors:
+  - id: error_handler
+    type: io.kestra.plugin.core.log.Log
+    message: Auto SearchAPI.io Google Lens API workflow failed. Check task logs for details.

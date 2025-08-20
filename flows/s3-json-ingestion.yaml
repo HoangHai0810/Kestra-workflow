@@ -1,0 +1,1127 @@
+id: s3-json-ingestion
+namespace: com.flowio
+description: "Process JSON files from S3 and insert into multiple databases"
+
+inputs:
+  - id: s3_bucket
+    type: STRING
+    defaults: "static-staging.flowio.app"
+  - id: s3_prefix
+    type: STRING
+    defaults: "resources/kestra_test/"
+  - id: table_name
+    type: STRING
+    defaults: "auto_lens_results"
+
+triggers:
+  - id: s3_trigger
+    type: io.kestra.plugin.aws.s3.Trigger
+    description: Auto-trigger when new file is uploaded to S3
+    bucket: "static-staging.flowio.app"
+    prefix: "resources/kestra_test/"
+    interval: PT1M
+    action: MOVE
+    moveTo:
+        key: "resources/kestra_test/processed/{{ trigger.objects[0].key | replace('resources/kestra_test/', '') }}"
+    filter: FILES
+    maxKeys: 1
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    region: "{{ secret('AWS_REGION') }}"
+
+tasks:
+
+  - id: parallel_create_tables
+    type: io.kestra.plugin.core.flow.Parallel
+    description: Create all database tables in parallel
+    tasks:
+      - id: create_timescaledb_table
+        type: io.kestra.plugin.jdbc.postgresql.Query
+        description: Create TimescaleDB table for SearchAPI.io Google Lens results
+        url: "jdbc:postgresql://postgres:5432/kestra_data"
+        username: "kestra_user"
+        password: "kestra_password"
+        sql: |
+            CREATE TABLE IF NOT EXISTS {{ inputs.table_name }} (
+                id SERIAL,
+                timestamp TIMESTAMPTZ NOT NULL,
+                source_image_url TEXT,
+                search_type VARCHAR(100),
+                search_query TEXT,
+                result_position INTEGER,
+                title TEXT,
+                link TEXT,
+                source TEXT,
+                price TEXT,
+                extracted_price DECIMAL(10,2),
+                currency VARCHAR(10),
+                stock_information TEXT,
+                thumbnail TEXT,
+                image_link TEXT,
+                image_width INTEGER,
+                image_height INTEGER,
+                extensions TEXT[],
+                image_url TEXT,
+                image_size_bytes BIGINT,
+                feature_type VARCHAR(100),
+                url TEXT,
+                score DECIMAL(3,2),
+                full_matches INTEGER,
+                partial_matches INTEGER,
+                similar_images INTEGER,
+                web_entities TEXT,
+                best_guess_labels TEXT,
+                PRIMARY KEY (timestamp, id)
+            );
+            
+            SELECT create_hypertable('{{ inputs.table_name }}', 'timestamp', if_not_exists => TRUE);
+            
+            CREATE INDEX IF NOT EXISTS idx_{{ inputs.table_name }}_timestamp ON {{ inputs.table_name }} (timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_{{ inputs.table_name }}_search_type ON {{ inputs.table_name }} (search_type);
+            CREATE INDEX IF NOT EXISTS idx_{{ inputs.table_name }}_source ON {{ inputs.table_name }} (source);
+            CREATE INDEX IF NOT EXISTS idx_{{ inputs.table_name }}_extracted_price ON {{ inputs.table_name }} (extracted_price);
+            CREATE INDEX IF NOT EXISTS idx_{{ inputs.table_name }}_source_url ON {{ inputs.table_name }} (source_image_url);
+
+      - id: create_clickhouse_table
+        type: io.kestra.plugin.scripts.python.Script
+        description: Create ClickHouse table for SearchAPI.io Google Lens results
+        script: |
+            import requests
+            import json
+            import os
+            
+            TABLE_NAME = "{{ inputs.table_name }}"
+            CLICKHOUSE_HOST = os.environ.get('CLICKHOUSE_HOST', 'host.docker.internal')
+            CLICKHOUSE_PORT = os.environ.get('CLICKHOUSE_PORT', '8123')
+            DATABASE = os.environ.get('DATABASE', 'kestra_data')
+            USERNAME = os.environ.get('USERNAME', 'admin')
+            PASSWORD = os.environ.get('PASSWORD', 'admin123')
+            
+            print(f"DEBUG: TABLE = {TABLE_NAME}")
+            print(f"DEBUG: CLICKHOUSE_HOST = {CLICKHOUSE_HOST}")
+            print(f"DEBUG: CLICKHOUSE_PORT = {CLICKHOUSE_PORT}")
+            print(f"DEBUG: DATABASE = {DATABASE}")
+            print(f"DEBUG: USERNAME = {USERNAME}")
+            print(f"DEBUG: PASSWORD = {PASSWORD}")
+            
+            if not TABLE_NAME:
+                print("Error: TABLE_NAME is required")
+                exit(1)
+            
+            base_url = f"http://{CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}"
+            
+            create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS {DATABASE}.{TABLE_NAME} (
+                id UInt32,
+                timestamp DateTime64(3),
+                source_image_url String,
+                search_type String,
+                search_query String,
+                result_position UInt32,
+                title String,
+                link String,
+                source String,
+                price String,
+                extracted_price Float64,
+                currency String,
+                stock_information String,
+                thumbnail String,
+                image_link String,
+                image_width UInt32,
+                image_height UInt32,
+                extensions Array(String),
+                image_url String,
+                image_size_bytes UInt64,
+                feature_type String,
+                url String,
+                score Float64,
+                full_matches UInt32,
+                partial_matches UInt32,
+                similar_images UInt32,
+                web_entities String,
+                best_guess_labels String
+            ) ENGINE = MergeTree()
+            PARTITION BY toYYYYMM(timestamp)
+            ORDER BY (timestamp, search_type, result_position)
+            SETTINGS index_granularity = 8192
+            """
+            
+            try:
+                response = requests.post(
+                    f"{base_url}/",
+                    params={
+                        'query': create_table_sql,
+                        'database': DATABASE
+                    },
+                    auth=(USERNAME, PASSWORD),
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    print(f"ClickHouse table '{TABLE_NAME}' created/verified successfully")
+                    print(f"clickhouse_status=success")
+                else:
+                    print(f"Failed to create ClickHouse table: HTTP {response.status_code}")
+                    print(f"Response: {response.text}")
+                    print(f"clickhouse_status=error")
+                    exit(1)
+                    
+            except Exception as e:
+                print(f"Error creating ClickHouse table: {e}")
+                print(f"clickhouse_status=error")
+                exit(1)
+
+      - id: create_elasticsearch_index
+        type: io.kestra.plugin.scripts.python.Script
+        description: Create Elasticsearch index for SearchAPI.io Google Lens results
+        script: |
+            import requests
+            import json
+            import os
+            
+            INDEX_NAME = "{{ inputs.table_name }}"
+            ES_HOST = os.environ.get('ES_HOST', 'host.docker.internal')
+            ES_PORT = os.environ.get('ES_PORT', '9200')
+            USERNAME = os.environ.get('USERNAME', 'elastic')
+            PASSWORD = os.environ.get('PASSWORD', 'elastic123')
+            
+            print(f"DEBUG: INDEX_NAME = {INDEX_NAME}")
+            print(f"DEBUG: ES_HOST = {ES_HOST}")
+            print(f"DEBUG: ES_PORT = {ES_PORT}")
+            print(f"DEBUG: USERNAME = {USERNAME}")
+            print(f"DEBUG: PASSWORD = {PASSWORD}")
+            
+            if not INDEX_NAME:
+                print("Error: INDEX_NAME is required")
+                exit(1)
+            
+            base_url = f"http://{ES_HOST}:{ES_PORT}"
+            auth = (USERNAME, PASSWORD) if USERNAME and PASSWORD else None
+            
+            index_mapping = {
+                "mappings": {
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "timestamp": {"type": "date"},
+                        "source_image_url": {"type": "keyword"},
+                        "search_type": {"type": "keyword"},
+                        "search_query": {"type": "text"},
+                        "result_position": {"type": "integer"},
+                        "title": {"type": "text"},
+                        "link": {"type": "keyword"},
+                        "source": {"type": "keyword"},
+                        "price": {"type": "keyword"},
+                        "extracted_price": {"type": "float"},
+                        "currency": {"type": "keyword"},
+                        "stock_information": {"type": "keyword"},
+                        "thumbnail": {"type": "keyword"},
+                        "image_link": {"type": "keyword"},
+                        "image_width": {"type": "integer"},
+                        "image_height": {"type": "integer"},
+                        "extensions": {"type": "keyword"},
+                        "image_url": {"type": "keyword"},
+                        "image_size_bytes": {"type": "long"},
+                        "feature_type": {"type": "keyword"},
+                        "url": {"type": "keyword"},
+                        "score": {"type": "float"},
+                        "full_matches": {"type": "integer"},
+                        "partial_matches": {"type": "integer"},
+                        "similar_images": {"type": "integer"},
+                        "web_entities": {"type": "text"},
+                        "best_guess_labels": {"type": "text"}
+                    }
+                },
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "analysis": {
+                        "analyzer": {
+                            "text_analyzer": {
+                                "type": "standard",
+                                "stopwords": "_english_"
+                            }
+                        }
+                    }
+                }
+            }
+            
+            try:
+                response = requests.head(f"{base_url}/{INDEX_NAME}", auth=auth, timeout=30)
+                
+                if response.status_code == 200:
+                    print(f"Elasticsearch index '{INDEX_NAME}' already exists")
+                    print(f"elasticsearch_status=success")
+                else:
+                    response = requests.put(
+                        f"{base_url}/{INDEX_NAME}",
+                        json=index_mapping,
+                        auth=auth,
+                        timeout=30
+                    )
+                    
+                    if response.status_code == 200:
+                        print(f"Elasticsearch index '{INDEX_NAME}' created successfully")
+                        print(f"elasticsearch_status=success")
+                    else:
+                        print(f"Failed to create Elasticsearch index: HTTP {response.status_code}")
+                        print(f"Response: {response.text}")
+                        print(f"elasticsearch_status=error")
+                        exit(1)
+                        
+            except Exception as e:
+                print(f"Error creating Elasticsearch index: {e}")
+                print(f"elasticsearch_status=error")
+                exit(1)
+
+      - id: create_qdrant_collection
+        type: io.kestra.plugin.scripts.python.Script
+        description: Create Qdrant collection for SearchAPI.io Google Lens results
+        script: |
+            import requests
+            import json
+            import os
+            
+            COLLECTION_NAME = "{{ inputs.table_name }}"
+            QDRANT_HOST = os.environ.get('QDRANT_HOST', 'host.docker.internal')
+            QDRANT_PORT = os.environ.get('QDRANT_PORT', '6333')
+            
+            print(f"DEBUG: COLLECTION_NAME = {COLLECTION_NAME}")
+            print(f"DEBUG: QDRANT_HOST = {QDRANT_HOST}")
+            print(f"DEBUG: QDRANT_PORT = {QDRANT_PORT}")
+            
+            if not COLLECTION_NAME:
+                print("Error: COLLECTION_NAME is required")
+                exit(1)
+            
+            base_url = f"http://{QDRANT_HOST}:{QDRANT_PORT}"
+            
+            collection_config = {
+                "vectors": {
+                    "size": 1536,
+                    "distance": "Cosine"
+                },
+                "on_disk_payload": True,
+                "optimizers_config": {
+                    "default_segment_number": 2,
+                    "memmap_threshold": 20000
+                }
+            }
+            
+            try:
+                response = requests.get(f"{base_url}/collections/{COLLECTION_NAME}", timeout=30)
+                
+                if response.status_code == 200:
+                    print(f"Qdrant collection '{COLLECTION_NAME}' already exists")
+                    print(f"qdrant_status=success")
+                else:
+                    response = requests.put(
+                        f"{base_url}/collections/{COLLECTION_NAME}",
+                        json=collection_config,
+                        timeout=30
+                    )
+                    
+                    if response.status_code == 200:
+                        print(f"Qdrant collection '{COLLECTION_NAME}' created successfully")
+                        print(f"qdrant_status=success")
+                    else:
+                        print(f"Failed to create Qdrant collection: HTTP {response.status_code}")
+                        print(f"Response: {response.text}")
+                        print(f"qdrant_status=error")
+                        exit(1)
+                        
+            except Exception as e:
+                print(f"Error creating Qdrant collection: {e}")
+                print(f"qdrant_status=error")
+                exit(1)
+  - id: transform_data
+    type: io.kestra.plugin.core.flow.Parallel
+    description: Copy data to all databases in parallel for better performance
+    tasks:
+      - id: copy_data_to_timescaledb
+        type: io.kestra.plugin.scripts.python.Script
+        description: Insert SearchAPI.io Google Lens API data into TimescaleDB
+        script: |
+          import subprocess
+          import sys
+          
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "psycopg2-binary"])
+          
+          import json
+          import psycopg2
+          from psycopg2.extras import execute_batch
+
+          TABLE_NAME = "{{ inputs.table_name }}"
+          JSON_PATH = "{{ trigger.objects[0].uri }}"
+          
+          DB_CONFIG = {
+              'host': 'host.docker.internal',
+              'port': 5432,
+              'database': 'kestra_data',
+              'user': 'kestra_user',
+              'password': 'kestra_password'
+          }
+
+          try:
+              with open(JSON_PATH, 'r') as f:
+                  data = json.load(f)
+              
+              if not data:
+                  print("No data to insert")
+                  exit(0)
+              
+              insert_data = []
+              for item in data:
+                  api_response = item.get('api_response', {})
+                  source_image_url = item.get('source_image_url', '')
+                  
+                  if 'visual_matches' in api_response:
+                      for match in api_response['visual_matches']:
+                          row = (
+                              item.get('timestamp', ''),
+                              source_image_url,
+                              'visual_matches',
+                              '',
+                              match.get('position', 0),
+                              match.get('title', ''),
+                              match.get('link', ''),
+                              match.get('source', ''),
+                              match.get('price', ''),
+                              match.get('extracted_price', 0.0),
+                              match.get('currency', ''),
+                              match.get('stock_information', ''),
+                              match.get('thumbnail', ''),
+                              match.get('image', {}).get('link', ''),
+                              match.get('image', {}).get('width', 0),
+                              match.get('image', {}).get('height', 0),
+                              [],
+                              match.get('image', {}).get('link', ''),
+                              0,
+                              'visual_matches',
+                              match.get('link', ''),
+                              1.0 - (match.get('position', 0) - 1) * 0.1,
+                              1 if match.get('position', 0) == 1 else 0,
+                              1 if match.get('position', 0) <= 3 else 0,
+                              len(api_response.get('visual_matches', [])),
+                              match.get('source', ''),
+                              match.get('title', '')
+                          )
+                          insert_data.append(row)
+                  
+                  if 'exact_matches' in api_response:
+                      for match in api_response['exact_matches']:
+                          row = (
+                              item.get('timestamp', ''),
+                              source_image_url,
+                              'exact_matches',
+                              '',
+                              match.get('position', 0),
+                              match.get('title', ''),
+                              match.get('link', ''),
+                              match.get('source', ''),
+                              match.get('price', ''),
+                              match.get('extracted_price', 0.0),
+                              match.get('currency', ''),
+                              match.get('stock_information', ''),
+                              match.get('thumbnail', ''),
+                              '',
+                              0,
+                              0,
+                              match.get('extensions', []),
+                              match.get('thumbnail', ''),
+                              0,
+                              'exact_matches',
+                              match.get('link', ''),
+                              1.0,
+                              1,
+                              0,
+                              len(api_response.get('exact_matches', [])),
+                              match.get('source', ''),
+                              match.get('title', '')
+                          )
+                          insert_data.append(row)
+                  
+                  if 'products' in api_response:
+                      for match in api_response['products']:
+                          row = (
+                              item.get('timestamp', ''),
+                              source_image_url,
+                              'products',
+                              '',
+                              match.get('position', 0),
+                              match.get('title', ''),
+                              match.get('link', ''),
+                              match.get('source', ''),
+                              match.get('price', ''),
+                              match.get('extracted_price', 0.0),
+                              match.get('currency', ''),
+                              match.get('stock_information', ''),
+                              match.get('thumbnail', ''),
+                              match.get('image', {}).get('link', ''),
+                              match.get('image', {}).get('width', 0),
+                              match.get('image', {}).get('height', 0),
+                              [],
+                              match.get('image', {}).get('link', ''),
+                              0,
+                              'products',
+                              match.get('link', ''),
+                              1.0 - (match.get('position', 0) - 1) * 0.1,
+                              1 if match.get('position', 0) == 1 else 0,
+                              1 if match.get('position', 0) <= 3 else 0,
+                              len(api_response.get('products', [])),
+                              match.get('source', ''),
+                              match.get('title', '')
+                          )
+                          insert_data.append(row)
+              
+              with psycopg2.connect(**DB_CONFIG) as conn:
+                  with conn.cursor() as cur:
+                      insert_query = f"""
+                      INSERT INTO {TABLE_NAME} (
+                          timestamp,
+                          source_image_url,
+                          search_type, search_query, result_position,
+                          title, link, source,
+                          price, extracted_price, currency, stock_information,
+                          thumbnail, image_link, image_width, image_height, extensions,
+                          image_url, image_size_bytes, feature_type, url, score,
+                          full_matches, partial_matches, similar_images, web_entities, best_guess_labels
+                      ) VALUES (
+                          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                      )
+                      """
+                      
+                      execute_batch(cur, insert_query, insert_data)
+                      conn.commit()
+                      
+                      print(f"Successfully inserted {len(insert_data)} rows into TimescaleDB")
+                      print(f"timescaledb_rows_inserted={len(insert_data)}")
+                      print("timescaledb_status=success")
+
+          except Exception as e:
+              print(f"Error processing data: {e}")
+              print("timescaledb_status=error")
+              print(f"timescaledb_error={str(e)}")
+              exit(1)
+
+      - id: copy_data_to_clickhouse
+        type: io.kestra.plugin.scripts.python.Script
+        description: Insert data into ClickHouse
+        script: |
+          import requests
+          import json
+          import os
+          
+          TABLE_NAME = "{{ inputs.table_name }}"
+          CLICKHOUSE_HOST = os.environ.get('CLICKHOUSE_HOST', 'host.docker.internal')
+          CLICKHOUSE_PORT = os.environ.get('CLICKHOUSE_PORT', '8123')
+          DATABASE = os.environ.get('DATABASE', 'kestra_data')
+          USERNAME = os.environ.get('USERNAME', 'admin')
+          PASSWORD = os.environ.get('PASSWORD', 'admin123')
+          JSON_PATH = "{{ trigger.objects[0].uri }}"
+          
+          print(f"DEBUG: TABLE = {TABLE_NAME}")
+          print(f"DEBUG: CLICKHOUSE_HOST = {CLICKHOUSE_HOST}")
+          print(f"DEBUG: CLICKHOUSE_PORT = {CLICKHOUSE_PORT}")
+          print(f"DEBUG: DATABASE = {DATABASE}")
+          print(f"DEBUG: USERNAME = {USERNAME}")
+          print(f"DEBUG: PASSWORD = {PASSWORD}")
+          print(f"DEBUG: JSON_PATH = {JSON_PATH}")
+          
+          if not TABLE_NAME:
+              print("Error: TABLE_NAME is required")
+              exit(1)
+          
+          base_url = f"http://{CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}"
+          
+          try:
+              with open(JSON_PATH, 'r') as f:
+                  data = json.load(f)
+              
+              if not data:
+                  print("No data to insert")
+                  exit(0)
+              
+              all_rows = []
+              for item in data:
+                  api_response = item.get('api_response', {})
+                  source_image_url = item.get('source_image_url', '')
+                  
+                  if 'visual_matches' in api_response:
+                      for match in api_response['visual_matches']:
+                          row = [
+                              item.get('timestamp', ''),
+                              source_image_url,
+                              'visual_matches',
+                              '',
+                              match.get('position', 0),
+                              match.get('title', ''),
+                              match.get('link', ''),
+                              match.get('source', ''),
+                              match.get('price', ''),
+                              match.get('extracted_price', 0.0),
+                              match.get('currency', ''),
+                              match.get('stock_information', ''),
+                              match.get('thumbnail', ''),
+                              match.get('image', {}).get('link', ''),
+                              match.get('image', {}).get('width', 0),
+                              match.get('image', {}).get('height', 0),
+                              [],
+                              match.get('image', {}).get('link', ''),
+                              0,
+                              'visual_matches',
+                              match.get('link', ''),
+                              1.0 - (match.get('position', 0) - 1) * 0.1,
+                              1 if match.get('position', 0) == 1 else 0,
+                              1 if match.get('position', 0) <= 3 else 0,
+                              len(api_response.get('visual_matches', [])),
+                              match.get('source', ''),
+                              match.get('title', '')
+                          ]
+                          all_rows.append(row)
+                  
+                  if 'exact_matches' in api_response:
+                      for match in api_response['exact_matches']:
+                          row = [
+                              item.get('timestamp', ''),
+                              source_image_url,
+                              'exact_matches',
+                              '',
+                              match.get('position', 0),
+                              match.get('title', ''),
+                              match.get('link', ''),
+                              match.get('source', ''),
+                              match.get('price', ''),
+                              match.get('extracted_price', 0.0),
+                              match.get('currency', ''),
+                              match.get('stock_information', ''),
+                              match.get('thumbnail', ''),
+                              '',
+                              0,
+                              0,
+                              match.get('extensions', []),
+                              match.get('thumbnail', ''),
+                              0,
+                              'exact_matches',
+                              match.get('link', ''),
+                              1.0,
+                              1,
+                              0,
+                              len(api_response.get('exact_matches', [])),
+                              match.get('source', ''),
+                              match.get('title', '')
+                          ]
+                          all_rows.append(row)
+                  
+                  if 'products' in api_response:
+                      for match in api_response['products']:
+                          row = [
+                              item.get('timestamp', ''),
+                              source_image_url,
+                              'products',
+                              '',
+                              match.get('position', 0),
+                              match.get('title', ''),
+                              match.get('link', ''),
+                              match.get('source', ''),
+                              match.get('price', ''),
+                              match.get('extracted_price', 0.0),
+                              match.get('currency', ''),
+                              match.get('stock_information', ''),
+                              match.get('thumbnail', ''),
+                              match.get('image', {}).get('link', ''),
+                              match.get('image', {}).get('width', 0),
+                              match.get('image', {}).get('height', 0),
+                              [],
+                              match.get('image', {}).get('link', ''),
+                              0,
+                              'products',
+                              match.get('link', ''),
+                              1.0 - (match.get('position', 0) - 1) * 0.1,
+                              1 if match.get('position', 0) == 1 else 0,
+                              1 if match.get('position', 0) <= 3 else 0,
+                              len(api_response.get('products', [])),
+                              match.get('source', ''),
+                              match.get('title', '')
+                          ]
+                          all_rows.append(row)
+              
+              if not all_rows:
+                  print("No rows to insert")
+                  exit(0)
+              
+              batch_size = 10000
+              total_inserted = 0
+              
+              for i in range(0, len(all_rows), batch_size):
+                  batch = all_rows[i:i + batch_size]
+                  batch_num = (i // batch_size) + 1
+                  
+                  values_str = ','.join(['(' + ','.join([f"'{str(val)}'" if isinstance(val, str) else str(val) for val in row]) + ')' for row in batch])
+                  
+                  insert_query = f"""
+                  INSERT INTO {DATABASE}.{TABLE_NAME} (
+                      id, timestamp, source_image_url, search_type, search_query, result_position,
+                      title, link, source, price, extracted_price, currency, stock_information,
+                      thumbnail, image_link, image_width, image_height, extensions,
+                      image_url, image_size_bytes, feature_type, url, score,
+                      full_matches, partial_matches, similar_images, web_entities, best_guess_labels
+                  ) VALUES {values_str}
+                  """
+                  
+                  response = requests.post(
+                      f"{base_url}/",
+                      params={'query': insert_query},
+                      auth=(USERNAME, PASSWORD),
+                      timeout=60
+                  )
+                  
+                  if response.status_code == 200:
+                      total_inserted += len(batch)
+                      print(f"Inserted batch {batch_num}: {len(batch)} rows")
+                  else:
+                      print(f"Failed to insert batch {batch_num}: HTTP {response.status_code}")
+                      print(f"Response: {response.text}")
+              
+              print(f"Total rows inserted: {total_inserted}")
+              print(f"clickhouse_data_status=success")
+              
+          except Exception as e:
+              print(f"Error inserting data into ClickHouse: {e}")
+              print(f"clickhouse_data_status=error")
+              exit(1)
+
+      - id: copy_data_to_elasticsearch
+        type: io.kestra.plugin.scripts.python.Script
+        description: Insert data into Elasticsearch
+        script: |
+          import requests
+          import json
+          import os
+          
+          INDEX_NAME = "{{ inputs.table_name }}"
+          ES_HOST = os.environ.get('ES_HOST', 'host.docker.internal')
+          ES_PORT = os.environ.get('ES_PORT', '9200')
+          USERNAME = os.environ.get('USERNAME', 'elastic')
+          PASSWORD = os.environ.get('PASSWORD', 'elastic123')
+          JSON_PATH = "{{ trigger.objects[0].uri }}"
+          
+          print(f"DEBUG: INDEX_NAME = {INDEX_NAME}")
+          print(f"DEBUG: ES_HOST = {ES_HOST}")
+          print(f"DEBUG: ES_PORT = {ES_PORT}")
+          print(f"DEBUG: USERNAME = {USERNAME}")
+          print(f"DEBUG: PASSWORD = {PASSWORD}")
+          print(f"DEBUG: JSON_PATH = {JSON_PATH}")
+          
+          if not INDEX_NAME:
+              print("Error: INDEX_NAME is required")
+              exit(1)
+          
+          base_url = f"http://{ES_HOST}:{ES_PORT}"
+          auth = (USERNAME, PASSWORD) if USERNAME and PASSWORD else None
+          
+          try:
+              with open(JSON_PATH, 'r') as f:
+                  data = json.load(f)
+              
+              if not data:
+                  print("No data to insert")
+                  exit(0)
+              
+              all_docs = []
+              for item in data:
+                  api_response = item.get('api_response', {})
+                  source_image_url = item.get('source_image_url', '')
+                  
+                  if 'visual_matches' in api_response:
+                      for match in api_response['visual_matches']:
+                          doc = {
+                              "id": match.get('id', 0),
+                              "timestamp": item.get('timestamp', ''),
+                              "source_image_url": source_image_url,
+                              "search_type": "visual_matches",
+                              "search_query": "",
+                              "result_position": match.get('position', 0),
+                              "title": match.get('title', ''),
+                              "link": match.get('link', ''),
+                              "source": match.get('source', ''),
+                              "price": match.get('price', ''),
+                              "extracted_price": match.get('extracted_price', 0.0),
+                              "currency": match.get('currency', ''),
+                              "stock_information": match.get('stock_information', ''),
+                              "thumbnail": match.get('thumbnail', ''),
+                              "image_link": match.get('image', {}).get('link', ''),
+                              "image_width": match.get('image', {}).get('width', 0),
+                              "image_height": match.get('image', {}).get('height', 0),
+                              "extensions": [],
+                              "image_url": match.get('image', {}).get('link', ''),
+                              "image_size_bytes": 0,
+                              "feature_type": "visual_matches",
+                              "url": match.get('link', ''),
+                              "score": 1.0 - (match.get('position', 0) - 1) * 0.1,
+                              "full_matches": 1 if match.get('position', 0) == 1 else 0,
+                              "partial_matches": 1 if match.get('position', 0) <= 3 else 0,
+                              "similar_images": len(api_response.get('visual_matches', [])),
+                              "web_entities": match.get('source', ''),
+                              "best_guess_labels": match.get('title', '')
+                          }
+                          all_docs.append(doc)
+                  
+                  if 'exact_matches' in api_response:
+                      for match in api_response['exact_matches']:
+                          doc = {
+                              "id": match.get('id', 0),
+                              "timestamp": item.get('timestamp', ''),
+                              "source_image_url": source_image_url,
+                              "search_type": "exact_matches",
+                              "search_query": "",
+                              "result_position": match.get('position', 0),
+                              "title": match.get('title', ''),
+                              "link": match.get('link', ''),
+                              "source": match.get('source', ''),
+                              "price": match.get('price', ''),
+                              "extracted_price": match.get('extracted_price', 0.0),
+                              "currency": match.get('currency', ''),
+                              "stock_information": match.get('stock_information', ''),
+                              "thumbnail": match.get('thumbnail', ''),
+                              "image_link": "",
+                              "image_width": 0,
+                              "image_height": 0,
+                              "extensions": match.get('extensions', []),
+                              "image_url": match.get('thumbnail', ''),
+                              "image_size_bytes": 0,
+                              "feature_type": "exact_matches",
+                              "url": match.get('link', ''),
+                              "score": 1.0,
+                              "full_matches": 1,
+                              "partial_matches": 0,
+                              "similar_images": len(api_response.get('exact_matches', [])),
+                              "web_entities": match.get('source', ''),
+                              "best_guess_labels": match.get('title', '')
+                          }
+                          all_docs.append(doc)
+                  
+                  if 'products' in api_response:
+                      for match in api_response['products']:
+                          doc = {
+                              "id": match.get('id', 0),
+                              "timestamp": item.get('timestamp', ''),
+                              "source_image_url": source_image_url,
+                              "search_type": "products",
+                              "search_query": "",
+                              "result_position": match.get('position', 0),
+                              "title": match.get('title', ''),
+                              "link": match.get('link', ''),
+                              "source": match.get('source', ''),
+                              "price": match.get('price', ''),
+                              "extracted_price": match.get('extracted_price', 0.0),
+                              "currency": match.get('currency', ''),
+                              "stock_information": match.get('stock_information', ''),
+                              "thumbnail": match.get('thumbnail', ''),
+                              "image_link": match.get('image', {}).get('link', ''),
+                              "image_width": match.get('image', {}).get('width', 0),
+                              "image_height": match.get('image', {}).get('height', 0),
+                              "extensions": [],
+                              "image_url": match.get('image', {}).get('link', ''),
+                              "image_size_bytes": 0,
+                              "feature_type": "products",
+                              "url": match.get('link', ''),
+                              "score": 1.0 - (match.get('position', 0) - 1) * 0.1,
+                              "full_matches": 1 if match.get('position', 0) == 1 else 0,
+                              "partial_matches": 1 if match.get('position', 0) <= 3 else 0,
+                              "similar_images": len(api_response.get('products', [])),
+                              "web_entities": match.get('source', ''),
+                              "best_guess_labels": match.get('title', '')
+                          }
+                          all_docs.append(doc)
+              
+              if not all_docs:
+                  print("No documents to insert")
+                  exit(0)
+              
+              batch_size = 1000
+              total_inserted = 0
+              
+              for i in range(0, len(all_docs), batch_size):
+                  batch = all_docs[i:i + batch_size]
+                  batch_num = (i // batch_size) + 1
+                  
+                  bulk_data = []
+                  for doc in batch:
+                      bulk_data.append({"index": {"_index": INDEX_NAME}})
+                      bulk_data.append(doc)
+                  
+                  bulk_body = '\n'.join([json.dumps(item) for item in bulk_data]) + '\n'
+                  
+                  response = requests.post(
+                      f"{base_url}/_bulk",
+                      data=bulk_body,
+                      auth=auth,
+                      headers={'Content-Type': 'application/x-ndjson'},
+                      timeout=60
+                  )
+                  
+                  if response.status_code == 200:
+                      result = response.json()
+                      if result.get('errors', False):
+                          print(f"Batch {batch_num} had errors: {result}")
+                      else:
+                          total_inserted += len(batch)
+                          print(f"Inserted batch {batch_num}: {len(batch)} documents")
+                  else:
+                      print(f"Failed to insert batch {batch_num}: HTTP {response.status_code}")
+                      print(f"Response: {response.text}")
+              
+              print(f"Total documents inserted: {total_inserted}")
+              print(f"elasticsearch_data_status=success")
+              
+          except Exception as e:
+              print(f"Error inserting data into Elasticsearch: {e}")
+              print(f"elasticsearch_data_status=error")
+              exit(1)
+
+      - id: copy_data_to_qdrant
+        type: io.kestra.plugin.scripts.python.Script
+        description: Insert data into Qdrant
+        script: |
+          import requests
+          import json
+          import os
+          
+          COLLECTION_NAME = "{{ inputs.table_name }}"
+          QDRANT_HOST = os.environ.get('QDRANT_HOST', 'host.docker.internal')
+          QDRANT_PORT = os.environ.get('QDRANT_PORT', '6333')
+          JSON_PATH = "{{ trigger.objects[0].uri }}"
+          
+          print(f"DEBUG: COLLECTION_NAME = {COLLECTION_NAME}")
+          print(f"DEBUG: QDRANT_HOST = {QDRANT_HOST}")
+          print(f"DEBUG: QDRANT_PORT = {QDRANT_PORT}")
+          print(f"DEBUG: JSON_PATH = {JSON_PATH}")
+          
+          if not COLLECTION_NAME:
+              print("Error: COLLECTION_NAME is required")
+              exit(1)
+          
+          base_url = f"http://{QDRANT_HOST}:{QDRANT_PORT}"
+          
+          try:
+              with open(JSON_PATH, 'r') as f:
+                  data = json.load(f)
+              
+              if not data:
+                  print("No data to insert")
+                  exit(0)
+              
+              all_points = []
+              point_id = 1
+              
+              for item in data:
+                  api_response = item.get('api_response', {})
+                  source_image_url = item.get('source_image_url', '')
+                  
+                  if 'visual_matches' in api_response:
+                      for match in api_response['visual_matches']:
+                          point = {
+                              "id": point_id,
+                              "payload": {
+                                  "timestamp": item.get('timestamp', ''),
+                                  "source_image_url": source_image_url,
+                                  "search_type": "visual_matches",
+                                  "search_query": "",
+                                  "result_position": match.get('position', 0),
+                                  "title": match.get('title', ''),
+                                  "link": match.get('link', ''),
+                                  "source": match.get('source', ''),
+                                  "price": match.get('price', ''),
+                                  "extracted_price": match.get('extracted_price', 0.0),
+                                  "currency": match.get('currency', ''),
+                                  "stock_information": match.get('stock_information', ''),
+                                  "thumbnail": match.get('thumbnail', ''),
+                                  "image_link": match.get('image', {}).get('link', ''),
+                                  "image_width": match.get('image', {}).get('width', 0),
+                                  "image_height": match.get('image', {}).get('height', 0),
+                                  "extensions": [],
+                                  "image_url": match.get('image', {}).get('link', ''),
+                                  "image_size_bytes": 0,
+                                  "feature_type": "visual_matches",
+                                  "url": match.get('link', ''),
+                                  "score": 1.0 - (match.get('position', 0) - 1) * 0.1,
+                                  "full_matches": 1 if match.get('position', 0) == 1 else 0,
+                                  "partial_matches": 1 if match.get('position', 0) <= 3 else 0,
+                                  "similar_images": len(api_response.get('visual_matches', [])),
+                                  "web_entities": match.get('source', ''),
+                                  "best_guess_labels": match.get('title', '')
+                              },
+                              "vectors": [0.0] * 1536
+                          }
+                          all_points.append(point)
+                          point_id += 1
+                  
+                  if 'exact_matches' in api_response:
+                      for match in api_response['exact_matches']:
+                          point = {
+                              "id": point_id,
+                              "payload": {
+                                  "timestamp": item.get('timestamp', ''),
+                                  "source_image_url": source_image_url,
+                                  "search_type": "exact_matches",
+                                  "search_query": "",
+                                  "result_position": match.get('position', 0),
+                                  "title": match.get('title', ''),
+                                  "link": match.get('link', ''),
+                                  "source": match.get('source', ''),
+                                  "price": match.get('price', ''),
+                                  "extracted_price": match.get('extracted_price', 0.0),
+                                  "currency": match.get('currency', ''),
+                                  "stock_information": match.get('stock_information', ''),
+                                  "thumbnail": match.get('thumbnail', ''),
+                                  "image_link": "",
+                                  "image_width": 0,
+                                  "image_height": 0,
+                                  "extensions": match.get('extensions', []),
+                                  "image_url": match.get('thumbnail', ''),
+                                  "image_size_bytes": 0,
+                                  "feature_type": "exact_matches",
+                                  "url": match.get('link', ''),
+                                  "score": 1.0,
+                                  "full_matches": 1,
+                                  "partial_matches": 0,
+                                  "similar_images": len(api_response.get('exact_matches', [])),
+                                  "web_entities": match.get('source', ''),
+                                  "best_guess_labels": match.get('title', '')
+                              },
+                              "vectors": [0.0] * 1536
+                          }
+                          all_points.append(point)
+                          point_id += 1
+                  
+                  if 'products' in api_response:
+                      for match in api_response['products']:
+                          point = {
+                              "id": point_id,
+                              "payload": {
+                                  "timestamp": item.get('timestamp', ''),
+                                  "source_image_url": source_image_url,
+                                  "search_type": "products",
+                                  "search_query": "",
+                                  "result_position": match.get('position', 0),
+                                  "title": match.get('title', ''),
+                                  "link": match.get('link', ''),
+                                  "source": match.get('source', ''),
+                                  "price": match.get('price', ''),
+                                  "extracted_price": match.get('extracted_price', 0.0),
+                                  "currency": match.get('currency', ''),
+                                  "stock_information": match.get('stock_information', ''),
+                                  "thumbnail": match.get('thumbnail', ''),
+                                  "image_link": match.get('image', {}).get('link', ''),
+                                  "image_width": match.get('image', {}).get('width', 0),
+                                  "image_height": match.get('image', {}).get('height', 0),
+                                  "extensions": [],
+                                  "image_url": match.get('image', {}).get('link', ''),
+                                  "image_size_bytes": 0,
+                                  "feature_type": "products",
+                                  "url": match.get('link', ''),
+                                  "score": 1.0 - (match.get('position', 0) - 1) * 0.1,
+                                  "full_matches": 1 if match.get('position', 0) == 1 else 0,
+                                  "partial_matches": 1 if match.get('position', 0) <= 3 else 0,
+                                  "similar_images": len(api_response.get('products', [])),
+                                  "web_entities": match.get('source', ''),
+                                  "best_guess_labels": match.get('title', '')
+                              },
+                              "vectors": [0.0] * 1536
+                          }
+                          all_points.append(point)
+                          point_id += 1
+              
+              if not all_points:
+                  print("No points to insert")
+                  exit(0)
+              
+              batch_size = 100
+              total_inserted = 0
+              
+              for i in range(0, len(all_points), batch_size):
+                  batch = all_points[i:i + batch_size]
+                  batch_num = (i // batch_size) + 1
+                  
+                  response = requests.put(
+                      f"{base_url}/collections/{COLLECTION_NAME}/points",
+                      json={"points": batch},
+                      timeout=60
+                  )
+                  
+                  if response.status_code == 200:
+                      result = response.json()
+                      if result.get('status') == 'ok':
+                          total_inserted += len(batch)
+                          print(f"Inserted batch {batch_num}: {len(batch)} points")
+                      else:
+                          print(f"Batch {batch_num} had errors: {result}")
+                  else:
+                      print(f"Failed to insert batch {batch_num}: HTTP {response.status_code}")
+                      print(f"Response: {response.text}")
+              
+              print(f"Total points processed: {total_inserted}")
+              print(f"qdrant_status=success")
+              print(f"qdrant_points_inserted={total_inserted}")
+              
+          except Exception as e:
+              print(f"Error inserting data into Qdrant: {e}")
+              print(f"qdrant_data_status=error")
+              exit(1)
+
+  - id: manual_execution
+    type: io.kestra.plugin.scripts.python.Script
+    description: Create test data for manual execution
+    script: |
+        import json
+        import os
+        
+        # Create test data for manual execution
+        test_data = [
+            {
+                "timestamp": "2025-08-20T14:30:00",
+                "source_image_url": "https://example.com/test-image.jpg",
+                "api_response": {
+                    "visual_matches": [
+                        {
+                            "id": 1,
+                            "position": 1,
+                            "title": "Test Product",
+                            "link": "https://example.com/product",
+                            "source": "Test Store",
+                            "price": "$99.99",
+                            "extracted_price": 99.99,
+                            "currency": "USD",
+                            "stock_information": "In Stock",
+                            "thumbnail": "https://example.com/thumb.jpg",
+                            "image": {
+                                "link": "https://example.com/image.jpg",
+                                "width": 800,
+                                "height": 600
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+        
+        # Save test data to file
+        test_file = "test_data.json"
+        with open(test_file, 'w') as f:
+            json.dump(test_data, f, indent=2)
+        
+        print(f"Created test data file: {test_file}")
+        print(f"Test data contains {len(test_data)} items")
+        
+        # Set output for next tasks
+        print(f"::test_file::{test_file}")
+        print(f"::test_data_count::{len(test_data)}")
+
+  - id: log_success
+    type: io.kestra.plugin.core.log.Log
+    message: "Data processing completed successfully for all databases"
+
+errors:
+  - id: error_handler
+    type: io.kestra.plugin.core.log.Log
+    message: "Flow failed. Check task logs for details."
